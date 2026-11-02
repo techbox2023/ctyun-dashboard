@@ -14,6 +14,7 @@ import os
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from Crypto.Cipher import PKCS1_v1_5
@@ -28,6 +29,48 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ---------------------------------------------------------------------------
+# 临时原始报文调试（ECLOUD_DEBUG_RAW=1 开启）
+#   把每个请求载荷（密码脱敏）与服务端解密后的原始 JSON 追加写入
+#   data/ecloud_raw_debug.jsonl，用于排查登录协议差异。默认关闭。
+# ---------------------------------------------------------------------------
+_DEBUG_RAW_PATH = Path(__file__).resolve().parents[2] / "data" / "ecloud_raw_debug.jsonl"
+_DEBUG_MASK_KEYS = {"password", "newPwd", "oldPwd", "verificationCode"}
+
+
+def debug_raw_enabled() -> bool:
+    return _env_truthy("ECLOUD_DEBUG_RAW", default=False)
+
+
+def _mask_secrets(obj):
+    """递归把敏感字段值替换为 ***（仅用于落盘调试日志）。"""
+    if isinstance(obj, dict):
+        return {k: ("***" if k in _DEBUG_MASK_KEYS else _mask_secrets(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_mask_secrets(x) for x in obj]
+    return obj
+
+
+def _dump_raw(stage: str, endpoint: str, data) -> None:
+    """开启调试时把一条记录以 JSONL 形式追加到 data/ecloud_raw_debug.jsonl。"""
+    if not debug_raw_enabled():
+        return
+    try:
+        _DEBUG_RAW_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "endpoint": endpoint,
+            "data": data,
+        }
+        with _DEBUG_RAW_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # 调试日志绝不能影响主流程
+        pass
 
 
 def trust_env_enabled() -> bool:
@@ -203,6 +246,7 @@ class EcloudHttpUtil:
         url = self._url_for(endpoint, base_url)
         timeout = config.LOGIN_TIMEOUT if endpoint in config.LOGIN_PATHS else config.API_TIMEOUT
 
+        _dump_raw("request", endpoint, {"url": url, "payload": _mask_secrets(merged)})
         resp = self._session.post(url, data=json.dumps(http_body), timeout=timeout)
         return self._handle_response(resp, endpoint)
 
@@ -236,6 +280,8 @@ class EcloudHttpUtil:
     def _handle_response(self, resp: requests.Response, endpoint: str) -> dict:
         """复刻 handleHttpOrOpError + handleServerError (line 225-236)。"""
         if resp.status_code != 200 or not resp.text:
+            _dump_raw("response_http_error", endpoint,
+                      {"status": resp.status_code, "text": resp.text[:2000]})
             raise EcloudError({
                 "errorCode": str(resp.status_code),
                 "errorMessage": f"HTTP {resp.status_code}: {resp.text[:200]}",
@@ -243,10 +289,12 @@ class EcloudHttpUtil:
         try:
             envelope = resp.json()
         except ValueError:
+            _dump_raw("response_non_json", endpoint, {"text": resp.text[:2000]})
             raise EcloudError({
                 "errorCode": "PARSE_ERROR",
                 "errorMessage": f"非 JSON 响应: {resp.text[:200]}",
             })
+        _dump_raw("response_envelope", endpoint, envelope)
         if "params" not in envelope:
             raise EcloudError(envelope)
 
@@ -254,7 +302,10 @@ class EcloudHttpUtil:
         try:
             obj = json.loads(plain)
         except ValueError:
+            _dump_raw("response_plain_non_json", endpoint, {"plain": plain[:2000]})
             raise EcloudError({"errorMessage": f"解密后非 JSON: {plain[:200]}"})
+
+        _dump_raw("response_plain", endpoint, obj)
 
         # state 校验 (ecloudHttpUtil.js:233)
         if obj.get("state") and obj["state"] != "OK":
