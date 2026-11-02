@@ -263,8 +263,10 @@ def op_login_sms(params: dict) -> dict:
     is_temp = bool(params.get("isTemporary"))
 
     if branch == login_mod.LoginResult.NEED_DEVICE_TRUST:
+        # 密码链路不传 loginUserName（官方仅在扫码/一码多号时才有该值），
+        # 误传手机号会触发服务端绑定校验 → [10002036] 该手机号未绑定该用户。
         r = login_mod.complete_device_trust(
-            http, mobile, code, login_username=username,
+            http, mobile, code,
             is_temporary=is_temp, code=s.get("loginCode"),
         )
     elif branch == login_mod.LoginResult.NEED_TWO_FACTOR:

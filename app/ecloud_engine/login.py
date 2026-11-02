@@ -203,28 +203,30 @@ def send_two_factor_sms(http: EcloudHttpUtil, mobile: str, username: str) -> dic
 
 
 def complete_device_trust(http: EcloudHttpUtil, mobile: str,
-                          verification_code: str, login_username: str = "",
+                          verification_code: str,
                           is_temporary: bool = False, code: str | None = None) -> dict:
     """
-    未授信设备 → 短信验证后信任/临时设备 (user.js loginTrustDevice)。
+    未授信设备 → 短信验证后信任/临时设备 (user.js loginTrustDevice, line 723-780)。
 
-    官方 payload:
-      {mobile, verificationCode, isNeedTemporaryDeviceSelection:true,
-       code: this.code, loginUserName?}
-    其中 code 来自密码登录 /login/verify 的 body.code，不是短信验证码。
-    真网实测 30002009 时 body.code 常为 null；官方仍会传 code:this.code（可为 null），
-    不可在客户端硬失败。成功后若返回 accessTicket，再走 temporaryDeviceSelection → verifyAccessTicket。
+    官方 payload（密码登录链路）严格为:
+      {mobile, verificationCode, isNeedTemporaryDeviceSelection:true, code:this.code}
+    其中两个字段的取舍是官方的既有语义，必须一致:
+      · this.code 仅当 /login/verify 的 body.code 为真值时才赋值，否则为 undefined，
+        JSON.stringify 会丢弃该键 → 不发 code。故这里同样只在 code 为真值时才带。
+      · loginUserName 在密码链路中恒为 undefined（只有扫码/一码多号 loginByCode 才赋值），
+        官方不发送该键。早期版本误把用户手输手机号当 loginUserName 传入，触发服务端
+        「该手机号是否绑定该用户」校验，真网返回 [10002036] 该手机号未绑定该用户 —— 已移除。
+
+    成功后若返回 accessTicket，再走 temporaryDeviceSelection → verifyAccessTicket。
     """
     verification_code = normalize_sms_code(verification_code)
-    # 官方始终带上 code 字段（可为 null/undefined）；勿因缺失直接拒绝
     payload = {
         "mobile": mobile,
         "verificationCode": verification_code,
         "isNeedTemporaryDeviceSelection": True,
-        "code": code,
     }
-    if login_username:
-        payload["loginUserName"] = login_username
+    if code:
+        payload["code"] = code
     resp = http.post(config.Endpoint.LOGIN_TRUST_DEVICE, payload)
 
     # 官方: accessTicket 后先让用户选永久/临时设备，再 verifyAccessTicket
